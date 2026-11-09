@@ -1,363 +1,165 @@
 #!/usr/bin/env python3
-"""Kubernetes production hardening helper.
+"""Generate a secure Kubernetes starter workload manifest.
 
-This script inspects common workload types (Deployment, StatefulSet, DaemonSet,
-Job, CronJob) and optionally applies a conservative hardening baseline:
+This is for a workload that has not been created yet. It generates a
+reviewable multi-document JSON/YAML file containing a dedicated ServiceAccount,
+a Deployment, and an internal ClusterIP Service. It does not connect to or
+change a cluster. The generated Deployment uses a restricted container
+security context, resource requests/limits, and HTTP health probes.
 
-- runAsNonRoot: true
-- allowPrivilegeEscalation: false
-- privileged: false
-- seccompProfile: RuntimeDefault
-- capabilities.drop: ["ALL"]
-- automountServiceAccountToken: false
-- readOnlyRootFilesystem: true (only applied when safe and explicitly enabled)
+Example:
+  python3 scripts/k8s_prod_hardening.py \\
+    --name my-app --namespace production --image registry.example.com/my-app:1.2.3 \\
+    --output my-app.json
+  kubectl apply --dry-run=server -f my-app.json
+  # After reviewing the server-side dry run:
+  kubectl apply -f my-app.json
 
-Default behavior is REPORT-ONLY. Use --apply to patch resources in-cluster.
+Choose an image built to run as UID 10001, listen on the configured port, and
+write only to mounted writable paths (the script mounts /tmp as an emptyDir).
+Review probes, resource sizing, ports, network policy, and storage needs for
+your application before applying to production.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import re
 import sys
+from pathlib import Path
 from typing import Any
 
-
-WORKLOAD_TYPES = ["deployments", "statefulsets", "daemonsets", "jobs", "cronjobs"]
-
-
-def run_kubectl(arguments: list[str], allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
-    cmd = ["kubectl", *arguments]
-    try:
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=120)
-    except FileNotFoundError:
-        print("ERROR: kubectl is not installed or not on PATH.", file=sys.stderr)
-        raise SystemExit(2)
-    except subprocess.TimeoutExpired:
-        print("ERROR: kubectl command timed out.", file=sys.stderr)
-        raise SystemExit(2)
-
-    if result.returncode != 0 and not allow_failure:
-        print(f"ERROR: kubectl {' '.join(cmd)} failed: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
-        raise SystemExit(result.returncode)
-    return result
+DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$ ".strip())
 
 
-def load_workloads(namespace: str | None, context: str | None) -> list[dict[str, Any]]:
-    args = []
-    if context:
-        args.extend(["--context", context])
-    args.extend(["get"])
-    if namespace:
-        args.extend(["-n", namespace])
-    else:
-        args.extend(["-A"])
-    for resource in WORKLOAD_TYPES:
-        args.append(resource)
-    args.extend(["-o", "json"])
-    result = run_kubectl(args)
-    payload = json.loads(result.stdout)
-    items = payload.get("items", [])
-    if not items:
-        print("No Kubernetes workloads were found in the selected scope.")
-    return items
+def valid_name(value: str) -> bool:
+    return len(value) <= 63 and bool(DNS_LABEL.fullmatch(value))
 
 
-def resolve_pod_spec(workload: dict[str, Any]) -> tuple[dict[str, Any], str, str, Any]:
-    kind = workload.get("kind", "Unknown")
-    metadata = workload.get("metadata") or {}
-    name = metadata.get("name", "<unnamed>")
-    namespace = metadata.get("namespace", "default")
-
-    if kind == "CronJob":
-        pod_spec = ((workload.get("spec") or {}).get("jobTemplate") or {}).get("spec", {}).get("template", {}).get("spec")
-        return pod_spec, kind, namespace, name
-    spec = workload.get("spec") or {}
-    template = spec.get("template") or {}
-    pod_spec = template.get("spec") or {}
-    return pod_spec, kind, namespace, name
+def image_is_pinned(image: str) -> bool:
+    if "@sha256:" in image:
+        return True
+    last_component = image.rsplit("/", 1)[-1]
+    return ":" in last_component and not last_component.endswith(":latest")
 
 
-def update_dict(target: dict[str, Any], updates: dict[str, Any]) -> None:
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
-            update_dict(target[key], value)
-        else:
-            target[key] = value
-
-
-def build_hardening_patch(pod_spec: dict[str, Any], enforce_readonly_rootfs: bool) -> dict[str, Any]:
-    patch: dict[str, Any] = {}
-    if not isinstance(pod_spec, dict):
-        return patch
-
-    pod_security = pod_spec.setdefault("securityContext", {})
-    if pod_security.get("runAsNonRoot") is not True:
-        pod_security["runAsNonRoot"] = True
-    if pod_security.get("seccompProfile", {}).get("type") != "RuntimeDefault":
-        pod_security["seccompProfile"] = {"type": "RuntimeDefault"}
-    if pod_spec.get("automountServiceAccountToken") is not False:
-        pod_spec["automountServiceAccountToken"] = False
-    if pod_spec.get("hostNetwork") is not False:
-        pod_spec["hostNetwork"] = False
-    if pod_spec.get("hostPID") is not False:
-        pod_spec["hostPID"] = False
-    if pod_spec.get("hostIPC") is not False:
-        pod_spec["hostIPC"] = False
-
-    for container_type in ("initContainers", "containers", "ephemeralContainers"):
-        for container in pod_spec.get(container_type) or []:
-            security = container.setdefault("securityContext", {})
-            if security.get("privileged") is not False:
-                security["privileged"] = False
-            if security.get("allowPrivilegeEscalation") is not False:
-                security["allowPrivilegeEscalation"] = False
-            if security.get("runAsNonRoot") is not True:
-                security["runAsNonRoot"] = True
-            if security.get("seccompProfile", {}).get("type") != "RuntimeDefault":
-                security["seccompProfile"] = {"type": "RuntimeDefault"}
-            capabilities = security.setdefault("capabilities", {})
-            if capabilities.get("drop") != ["ALL"]:
-                capabilities["drop"] = ["ALL"]
-            if enforce_readonly_rootfs:
-                if security.get("readOnlyRootFilesystem") is not True:
-                    security["readOnlyRootFilesystem"] = True
-
-    return patch
-
-
-def printable_patch(pod_spec: dict[str, Any], enforce_readonly_rootfs: bool) -> dict[str, Any]:
-    """Return a patch object that reflects the intended security changes."""
-    patch: dict[str, Any] = {}
-    target = patch
-    pod = target
-    pod["securityContext"] = {}
-    pod["automountServiceAccountToken"] = False
-    pod["hostNetwork"] = False
-    pod["hostPID"] = False
-    pod["hostIPC"] = False
-    pod["securityContext"]["runAsNonRoot"] = True
-    pod["securityContext"]["seccompProfile"] = {"type": "RuntimeDefault"}
-
-    containers = []
-    for key in ("containers", "initContainers", "ephemeralContainers"):
-        for item in pod_spec.get(key) or []:
-            containers.append(item)
-
-    if containers:
-        pod["containers"] = []
-        for container in containers:
-            c = {
-                "name": container.get("name", "<unnamed>"),
-                "securityContext": {
-                    "privileged": False,
-                    "allowPrivilegeEscalation": False,
-                    "runAsNonRoot": True,
-                    "seccompProfile": {"type": "RuntimeDefault"},
-                    "capabilities": {"drop": ["ALL"]},
+def build_manifest(name: str, namespace: str, image: str, port: int, health_path: str, replicas: int) -> list[dict[str, Any]]:
+    labels = {"app.kubernetes.io/name": name}
+    common = {"namespace": namespace}
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {**common, "name": name, "labels": labels},
+            "automountServiceAccountToken": False,
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {**common, "name": name, "labels": labels},
+            "spec": {
+                "replicas": replicas,
+                "revisionHistoryLimit": 3,
+                "selector": {"matchLabels": labels},
+                "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "serviceAccountName": name,
+                        "automountServiceAccountToken": False,
+                        "terminationGracePeriodSeconds": 30,
+                        "securityContext": {
+                            "runAsNonRoot": True,
+                            "runAsUser": 10001,
+                            "runAsGroup": 10001,
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        },
+                        "containers": [
+                            {
+                                "name": name,
+                                "image": image,
+                                "imagePullPolicy": "IfNotPresent",
+                                "ports": [{"name": "http", "containerPort": port, "protocol": "TCP"}],
+                                "securityContext": {
+                                    "allowPrivilegeEscalation": False,
+                                    "privileged": False,
+                                    "readOnlyRootFilesystem": True,
+                                    "runAsNonRoot": True,
+                                    "runAsUser": 10001,
+                                    "runAsGroup": 10001,
+                                    "capabilities": {"drop": ["ALL"]},
+                                    "seccompProfile": {"type": "RuntimeDefault"},
+                                },
+                                "resources": {
+                                    "requests": {"cpu": "100m", "memory": "128Mi"},
+                                    "limits": {"cpu": "500m", "memory": "256Mi"},
+                                },
+                                "startupProbe": {
+                                    "httpGet": {"path": health_path, "port": "http"},
+                                    "periodSeconds": 5,
+                                    "failureThreshold": 30,
+                                },
+                                "readinessProbe": {
+                                    "httpGet": {"path": health_path, "port": "http"},
+                                    "periodSeconds": 5,
+                                    "failureThreshold": 3,
+                                },
+                                "livenessProbe": {
+                                    "httpGet": {"path": health_path, "port": "http"},
+                                    "periodSeconds": 10,
+                                    "failureThreshold": 3,
+                                },
+                                "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                            }
+                        ],
+                        "volumes": [{"name": "tmp", "emptyDir": {"sizeLimit": "64Mi"}}],
+                    },
                 },
-            }
-            if enforce_readonly_rootfs:
-                c["securityContext"]["readOnlyRootFilesystem"] = True
-            pod["containers"].append(c)
-
-    return patch
-
-
-def patch_workload(kind: str, namespace: str, name: str, pod_spec: dict[str, Any], apply: bool, enforce_readonly_rootfs: bool, context: str | None) -> tuple[bool, dict[str, Any]]:
-    patch = build_hardening_patch(pod_spec, enforce_readonly_rootfs)
-    if not patch:
-        return False, {}
-
-    if not apply:
-        return True, printable_patch(pod_spec, enforce_readonly_rootfs)
-
-    resource = kind.lower()
-    if resource.endswith("s") and resource not in {"daemonsets", "statefulsets", "deployments", "jobs"}:
-        pass
-
-    # kubectl uses singular resource names for patching; map common workload names.
-    resource_map = {
-        "Deployment": "deployment",
-        "StatefulSet": "statefulset",
-        "DaemonSet": "daemonset",
-        "Job": "job",
-        "CronJob": "cronjob",
-    }
-    resource_name = resource_map.get(kind, kind.lower())
-    patch_json = json.dumps(patch)
-    cmd = ["patch", resource_name, name, "-n", namespace, "--type", "merge", "-p", patch_json]
-    if context:
-        cmd = ["--context", context] + cmd
-    result = run_kubectl(["kubectl", *cmd], allow_failure=False)
-    return result.returncode == 0, patch
-
-
-def find_pod_spec_from_item(item: dict[str, Any]) -> dict[str, Any]:
-    if item.get("kind") == "CronJob":
-        return ((item.get("spec") or {}).get("jobTemplate") or {}).get("spec", {}).get("template", {}).get("spec", {})
-    return ((item.get("spec") or {}).get("template") or {}).get("spec", {})
-
-
-def workload_candidate_items(payload: list[dict[str, Any]]) -> list[tuple[str, str, str, dict[str, Any]]]:
-    candidates = []
-    for item in payload:
-        kind = item.get("kind", "Unknown")
-        metadata = item.get("metadata") or {}
-        name = metadata.get("name", "<unnamed>")
-        namespace = metadata.get("namespace", "default")
-        pod_spec = find_pod_spec_from_item(item)
-        if isinstance(pod_spec, dict):
-            candidates.append((kind, namespace, name, pod_spec))
-    return candidates
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {**common, "name": name, "labels": labels},
+            "spec": {
+                "type": "ClusterIP",
+                "selector": labels,
+                "ports": [{"name": "http", "port": port, "targetPort": "http", "protocol": "TCP"}],
+            },
+        },
+    ]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Conservative Kubernetes production hardening helper")
-    parser.add_argument("--namespace", help="Namespace to scan; default: all namespaces")
-    parser.add_argument("--context", help="kubectl context to use")
-    parser.add_argument("--apply", action="store_true", help="Apply the hardening baseline to matching workloads")
-    parser.add_argument("--enforce-readonly-rootfs", action="store_true", help="Also set readOnlyRootFilesystem=true where appropriate")
-    parser.add_argument("--dry-run", action="store_true", help="Alias for report-only behavior (default)")
+    parser = argparse.ArgumentParser(description="Generate a hardened Kubernetes Deployment starter manifest")
+    parser.add_argument("--name", default="my-app", help="Kubernetes app name (default: my-app)")
+    parser.add_argument("--namespace", default="production", help="target namespace (default: production; it must already exist)")
+    parser.add_argument("--image", required=True, help="container image pinned to a version tag or sha256 digest")
+    parser.add_argument("--port", type=int, default=8080, help="container and Service port (default: 8080)")
+    parser.add_argument("--health-path", default="/healthz", help="HTTP startup/readiness/liveness endpoint (default: /healthz)")
+    parser.add_argument("--replicas", type=int, default=2, help="initial replica count (default: 2)")
+    parser.add_argument("--output", help="write manifest to this file; default: standard output")
     args = parser.parse_args()
 
-    payload = []
-    for resource in WORKLOAD_TYPES:
-        current = run_kubectl([
-            "get", resource,
-            *( ["-n", args.namespace] if args.namespace else ["-A"]),
-            *( ["--context", args.context] if args.context else []),
-            "-o", "json"
-        ], allow_failure=True)
-        if current.returncode != 0:
-            continue
-        try:
-            data = json.loads(current.stdout)
-        except json.JSONDecodeError:
-            continue
-        for item in data.get("items", []):
-            payload.append(item)
+    if not valid_name(args.name) or not valid_name(args.namespace):
+        parser.error("--name and --namespace must be lowercase Kubernetes DNS labels (up to 63 characters)")
+    if not image_is_pinned(args.image):
+        parser.error("--image must use an explicit non-latest tag or an @sha256 digest")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if args.replicas < 1:
+        parser.error("--replicas must be at least 1")
+    if not args.health_path.startswith("/") or "\n" in args.health_path:
+        parser.error("--health-path must be an HTTP path starting with '/'")
 
-    if not payload:
-        print("No workload resources were found in scope.")
-        return 0
-
-    changed = 0
-    print(f"Scanning {len(payload)} workload(s) for production hardening issues...")
-    for kind, namespace, name, pod_spec in workload_candidate_items(payload):
-        patch = build_hardening_patch(pod_spec, args.enforce_readonly_rootfs)
-        if not patch:
-            continue
-        print(f"{kind}/{namespace}/{name}: would apply hardening baseline")
-        changed += 1
-
-        if args.apply:
-            # Rebuild a patch because kubectl requires actual mutation content.
-            resource_name = {
-                "Deployment": "deployment",
-                "StatefulSet": "statefulset",
-                "DaemonSet": "daemonset",
-                "Job": "job",
-                "CronJob": "cronjob",
-            }.get(kind, kind.lower())
-            patch_json = json.dumps({
-                "spec": {
-                    "template": {"spec": {
-                        "securityContext": pod_spec.get("securityContext", {}),
-                        "automountServiceAccountToken": False,
-                        "hostNetwork": False,
-                        "hostPID": False,
-                        "hostIPC": False,
-                        "containers": [],
-                        "initContainers": [],
-                    }}
-                }
-            })
-            if kind == "CronJob":
-                patch_json = json.dumps({
-                    "spec": {
-                        "jobTemplate": {
-                            "spec": {
-                                "template": {"spec": {
-                                    "securityContext": pod_spec.get("securityContext", {}),
-                                    "automountServiceAccountToken": False,
-                                    "hostNetwork": False,
-                                    "hostPID": False,
-                                    "hostIPC": False,
-                                    "containers": [],
-                                    "initContainers": [],
-                                }}
-                            }
-                        }
-                    }
-                })
-
-            # Build concrete container list to patch.
-            containers = []
-            for key in ("containers", "initContainers", "ephemeralContainers"):
-                for c in pod_spec.get(key) or []:
-                    sc = c.get("securityContext") or {}
-                    sc["privileged"] = False
-                    sc["allowPrivilegeEscalation"] = False
-                    sc["runAsNonRoot"] = True
-                    sc["seccompProfile"] = {"type": "RuntimeDefault"}
-                    sc.setdefault("capabilities", {})["drop"] = ["ALL"]
-                    if args.enforce_readonly_rootfs:
-                        sc["readOnlyRootFilesystem"] = True
-                    containers.append({"name": c.get("name", "<unnamed>"), "securityContext": sc})
-
-            if kind == "CronJob":
-                patch_json = json.dumps({
-                    "spec": {
-                        "jobTemplate": {
-                            "spec": {
-                                "template": {
-                                    "spec": {
-                                        "securityContext": pod_spec.get("securityContext", {}),
-                                        "automountServiceAccountToken": False,
-                                        "hostNetwork": False,
-                                        "hostPID": False,
-                                        "hostIPC": False,
-                                        "containers": containers,
-                                        "initContainers": [],
-                                    }
-                                }
-                            }
-                        }
-                    }
-                })
-            else:
-                patch_json = json.dumps({
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "securityContext": pod_spec.get("securityContext", {}),
-                                "automountServiceAccountToken": False,
-                                "hostNetwork": False,
-                                "hostPID": False,
-                                "hostIPC": False,
-                                "containers": containers,
-                                "initContainers": [],
-                            }
-                        }
-                    }
-                })
-
-            cmd = ["patch", resource_name, name, "-n", namespace, "--type", "merge", "-p", patch_json]
-            if args.context:
-                cmd = ["--context", args.context] + cmd
-
-            result = run_kubectl(cmd, allow_failure=True)
-            if result.returncode == 0:
-                print(f"  PATCHED: {kind}/{namespace}/{name}")
-            else:
-                print(f"  PATCH FAILED: {kind}/{namespace}/{name}: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
-
-    if args.apply:
-        print(f"\nApplied baseline to {changed} workload(s).")
+    documents = build_manifest(args.name, args.namespace, args.image, args.port, args.health_path, args.replicas)
+    rendered = "\n---\n".join(json.dumps(document, indent=2) for document in documents) + "\n"
+    if args.output:
+        Path(args.output).write_text(rendered, encoding="utf-8")
+        print(f"Wrote manifest to {args.output}. Review it before applying.", file=sys.stderr)
     else:
-        print(f"\n{changed} workload(s) are eligible for hardening. Re-run with --apply to patch them.")
+        sys.stdout.write(rendered)
     return 0
 
 
